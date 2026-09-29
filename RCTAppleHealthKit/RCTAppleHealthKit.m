@@ -24,6 +24,7 @@
 #import "RCTAppleHealthKit+Methods_Hearing.h"
 #import "RCTAppleHealthKit+Methods_Summary.h"
 #import "RCTAppleHealthKit+Methods_ClinicalRecords.h"
+#import "RCTAppleHealthKit+BackgroundDelivery.h"
 
 #import <React/RCTBridgeModule.h>
 #import <React/RCTEventDispatcher.h>
@@ -252,6 +253,18 @@ RCT_EXPORT_METHOD(getWorkoutRouteSamples:(NSDictionary *)input callback:(RCTResp
 {
     [self _initializeHealthStore];
     [self workout_getRoute:input callback:callback];
+}
+
+// Background delivery registered from JS; see RCTAppleHealthKit+BackgroundDelivery.m.
+RCT_EXPORT_METHOD(registerBackgroundDelivery:(NSArray *)types callback:(RCTResponseSenderBlock)callback)
+{
+    [self _initializeHealthStore];
+    [self bg_registerDelivery:types callback:callback];
+}
+
+RCT_EXPORT_METHOD(completeBackgroundDelivery:(NSString *)deliveryId)
+{
+    [self bg_completeDelivery:deliveryId];
 }
 
 RCT_EXPORT_METHOD(setObserver:(NSDictionary *)input)
@@ -723,7 +736,8 @@ RCT_EXPORT_METHOD(getClinicalRecords:(NSDictionary *)input callback:(RCTResponse
         @"ProcedureRecord",
         @"VitalSignRecord",
         @"SleepAnalysis",
-        @"InsulinDelivery"
+        @"InsulinDelivery",
+        @"RespiratoryRate"
     ];
     
     NSArray *templates = @[@"healthKit:%@:new", @"healthKit:%@:failure", @"healthKit:%@:enabled", @"healthKit:%@:sample", @"healthKit:%@:setup:success", @"healthKit:%@:setup:failure"];
