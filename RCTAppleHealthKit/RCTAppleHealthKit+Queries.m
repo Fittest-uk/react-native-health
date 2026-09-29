@@ -13,6 +13,34 @@
 #import <React/RCTBridgeModule.h>
 #import <React/RCTEventDispatcher.h>
 
+/*!
+    Workout metadata in a form that always crosses to JS.
+
+    HKWorkout metadata can hold HKQuantity values (Apple's HKAverageMETs,
+    HKWeatherTemperature, HKElevationAscended...) and dates, which the bridge
+    cannot convert, and a workout with no metadata used to put nil into the
+    anchored query's dictionary literal, throwing and dropping that workout.
+    Strings, numbers and booleans pass through unchanged (so custom keys such
+    as FittestLocal / FittestSessionId / FittestWorkoutId arrive as written),
+    dates become ISO-8601 strings, anything else its description; no metadata
+    becomes NSNull.
+ */
+static id RNHJSONSafeMetadata(NSDictionary *metadata) {
+    if (metadata == nil) return [NSNull null];
+    NSMutableDictionary *safe = [NSMutableDictionary dictionaryWithCapacity:metadata.count];
+    [metadata enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+        if (![key isKindOfClass:[NSString class]]) return;
+        if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSNumber class]]) {
+            safe[key] = value;
+        } else if ([value isKindOfClass:[NSDate class]]) {
+            safe[key] = [RCTAppleHealthKit buildISO8601StringFromDate:value];
+        } else if (value != nil) {
+            safe[key] = [value description];
+        }
+    }];
+    return safe;
+}
+
 @implementation RCTAppleHealthKit (Queries)
 
 - (void)fetchWorkoutById:(HKSampleType *)type
@@ -348,7 +376,7 @@
                                                    @"activityName" : type,
                                                    @"calories" : @(energy),
                                                    @"tracked" : @(isTracked),
-                                                   @"metadata" : [sample metadata] ? [sample metadata] : [NSNull null],
+                                                   @"metadata" : RNHJSONSafeMetadata([sample metadata]),
                                                    @"sourceName" : [[[sample sourceRevision] source] name],
                                                    @"sourceId" : [[[sample sourceRevision] source] bundleIdentifier],
                                                    @"device": device,
@@ -542,7 +570,7 @@
                                                @"activityName" : type,
                                                @"calories" : @(energy),
                                                @"tracked" : @(isTracked),
-                                               @"metadata" : [sample metadata],
+                                               @"metadata" : RNHJSONSafeMetadata([sample metadata]),
                                                @"sourceName" : [[[sample sourceRevision] source] name],
                                                @"sourceId" : [[[sample sourceRevision] source] bundleIdentifier],
                                                @"device": device,
