@@ -7,6 +7,7 @@
 #import "RCTAppleHealthKit+Utils.h"
 
 #import <HealthKit/HealthKit.h>
+#import <CoreLocation/CoreLocation.h>
 #import <objc/runtime.h>
 
 #if __has_include(<WatchConnectivity/WatchConnectivity.h>)
@@ -16,12 +17,12 @@
 #define RNH_HAS_WATCH_CONNECTIVITY 0
 #endif
 
-// Associated-object keys — the category needs to keep references to the
-// session, builder, and query so they survive across start/stop calls.
-static char const * const kRNHWorkoutSessionKey = "RNHWorkoutSession";
-static char const * const kRNHWorkoutBuilderKey = "RNHWorkoutBuilder";
-static char const * const kRNHWorkoutHRQueryKey = "RNHWorkoutHRQuery";
-static char const * const kRNHWorkoutSessionStartKey = "RNHWorkoutSessionStart";
+// Declare the class conforms to CLLocationManagerDelegate so setting
+// `manager.delegate = self` doesn't trip a compiler warning. Conformance is
+// runtime-checked anyway; this keeps the .h clean (no CoreLocation leak to
+// other categories that don't need it).
+@interface RCTAppleHealthKit (RNHLocationDelegate) <CLLocationManagerDelegate>
+@end
 
 // Live heart rate straight from the session. HealthKit routes an accessory's
 // readings (AirPods Pro 3 / Powerbeats Pro 2) into the live workout builder
@@ -31,6 +32,16 @@ static char const * const kRNHWorkoutSessionStartKey = "RNHWorkoutSessionStart";
 // HealthKit-delegate free.
 @interface RCTAppleHealthKit (RNHLiveBuilderDelegate) <HKLiveWorkoutBuilderDelegate>
 @end
+
+// Associated-object keys — the category needs to keep references to the
+// session, builder, query, route builder, and location manager so they
+// survive across start/stop calls.
+static char const * const kRNHWorkoutSessionKey = "RNHWorkoutSession";
+static char const * const kRNHWorkoutBuilderKey = "RNHWorkoutBuilder";
+static char const * const kRNHWorkoutHRQueryKey = "RNHWorkoutHRQuery";
+static char const * const kRNHWorkoutSessionStartKey = "RNHWorkoutSessionStart";
+static char const * const kRNHRouteBuilderKey = "RNHRouteBuilder";
+static char const * const kRNHLocationManagerKey = "RNHLocationManager";
 
 @implementation RCTAppleHealthKit (Methods_WorkoutSession)
 
@@ -62,6 +73,20 @@ static char const * const kRNHWorkoutSessionStartKey = "RNHWorkoutSessionStart";
 }
 - (void)rnh_setWorkoutSessionStart:(NSDate *)value {
     objc_setAssociatedObject(self, kRNHWorkoutSessionStartKey, value, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (id)rnh_routeBuilder {
+    return objc_getAssociatedObject(self, kRNHRouteBuilderKey);
+}
+- (void)rnh_setRouteBuilder:(id)value {
+    objc_setAssociatedObject(self, kRNHRouteBuilderKey, value, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (CLLocationManager *)rnh_locationManager {
+    return objc_getAssociatedObject(self, kRNHLocationManagerKey);
+}
+- (void)rnh_setLocationManager:(CLLocationManager *)value {
+    objc_setAssociatedObject(self, kRNHLocationManagerKey, value, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 #pragma mark - Helpers
@@ -198,9 +223,37 @@ static char const * const kRNHWorkoutSessionStartKey = "RNHWorkoutSessionStart";
         [self rnh_setWorkoutHRQuery:query];
         [self rnh_setWorkoutSessionStart:startDate];
 
+        // GPS / route capture. Caller passes gpsEnabled=YES for outdoor
+        // activity types (run/cycle/walk). HKWorkoutRouteBuilder collects
+        // CLLocation samples and attaches them to the persisted HKWorkout
+        // at finishWorkout time, so the route shows up in Apple Health
+        // Activity app. We still need to operate the CLLocationManager
+        // ourselves — HealthKit doesn't pull location for us.
+        BOOL gpsEnabled = [RCTAppleHealthKit boolFromOptions:input key:@"gpsEnabled" withDefault:NO];
+        if (gpsEnabled) {
+            HKWorkoutRouteBuilder *routeBuilder = [[HKWorkoutRouteBuilder alloc] initWithHealthStore:self.healthStore device:nil];
+            [self rnh_setRouteBuilder:routeBuilder];
+
+            CLLocationManager *manager = [[CLLocationManager alloc] init];
+            manager.delegate = self;
+            manager.desiredAccuracy = kCLLocationAccuracyBestForNavigation;
+            manager.distanceFilter = kCLDistanceFilterNone;
+            manager.activityType = CLActivityTypeFitness;
+            // WhenInUse is sufficient while the app is foreground or
+            // workout-processing background mode is active. Background
+            // operation while screen-locked would need
+            // requestAlwaysAuthorization + a separate Info.plist key —
+            // out of scope for slice 2.
+            [manager requestWhenInUseAuthorization];
+            [manager startUpdatingLocation];
+            [self rnh_setLocationManager:manager];
+            NSLog(@"[iPhoneWorkout][native] GPS capture started");
+        }
+
         callback(@[[NSNull null], @{
             @"started": @YES,
             @"startDate": @([startDate timeIntervalSince1970] * 1000),
+            @"gpsEnabled": @(gpsEnabled),
         }]);
         return;
     }
@@ -238,6 +291,19 @@ static char const * const kRNHWorkoutSessionStartKey = "RNHWorkoutSessionStart";
         if (query) {
             [self.healthStore stopQuery:query];
         }
+
+        // Stop pulling new GPS samples now. Route finalization happens
+        // below in the discard / finish branches — we need the persisted
+        // HKWorkout to attach the route to, which we don't have until
+        // finishWorkoutWithCompletion fires.
+        CLLocationManager *locationManager = self.rnh_locationManager;
+        if (locationManager) {
+            [locationManager stopUpdatingLocation];
+            locationManager.delegate = nil;
+            [self rnh_setLocationManager:nil];
+        }
+        HKWorkoutRouteBuilder *routeBuilder = self.rnh_routeBuilder;
+        [self rnh_setRouteBuilder:nil];
 
         // Caller can pass discard=YES to drop the workout instead of
         // saving it to HealthKit. Used by the Devices screen's scan-mode
@@ -312,10 +378,31 @@ static char const * const kRNHWorkoutSessionStartKey = "RNHWorkoutSessionStart";
 
         [builder endCollectionWithEndDate:endDate completion:^(BOOL success, NSError * _Nullable err) {
             [builder finishWorkoutWithCompletion:^(HKWorkout * _Nullable workout, NSError * _Nullable finishErr) {
-                clearAndCallback(@{
-                    @"stopped": @YES,
-                    @"endDate": @([endDate timeIntervalSince1970] * 1000),
-                });
+                // Attach accumulated route samples to the persisted
+                // HKWorkout. If the route builder has no samples (user
+                // declined location auth, or workout was indoor), this
+                // calls back with route=nil and that's fine.
+                if (routeBuilder && workout) {
+                    [routeBuilder finishRouteWithWorkout:workout
+                                                 metadata:nil
+                                                completion:^(HKWorkoutRoute * _Nullable route, NSError * _Nullable routeErr) {
+                        if (routeErr) {
+                            NSLog(@"[iPhoneWorkout][native] finishRoute failed: %@", routeErr.localizedDescription);
+                        } else if (route) {
+                            NSLog(@"[iPhoneWorkout][native] route saved to HealthKit");
+                        }
+                        clearAndCallback(@{
+                            @"stopped": @YES,
+                            @"endDate": @([endDate timeIntervalSince1970] * 1000),
+                            @"routeSaved": @(route != nil),
+                        });
+                    }];
+                } else {
+                    clearAndCallback(@{
+                        @"stopped": @YES,
+                        @"endDate": @([endDate timeIntervalSince1970] * 1000),
+                    });
+                }
             }];
         }];
         return;
@@ -457,6 +544,53 @@ static char const * const kRNHWorkoutSessionStartKey = "RNHWorkoutSessionStart";
         }];
     }];
     [self.healthStore executeQuery:q];
+}
+
+#pragma mark - CLLocationManagerDelegate
+
+- (void)locationManager:(CLLocationManager *)manager
+     didUpdateLocations:(NSArray<CLLocation *> *)locations {
+    HKWorkoutRouteBuilder *routeBuilder = self.rnh_routeBuilder;
+    if (!routeBuilder) return;
+    NSDate *now = [NSDate date];
+    NSMutableArray<CLLocation *> *filtered = [NSMutableArray arrayWithCapacity:locations.count];
+    for (CLLocation *loc in locations) {
+        // Drop low-accuracy fixes (HK route docs recommend < 50m horizontal)
+        // and stale samples (>30s) — both are common during initial GPS
+        // acquisition and produce noisy route lines.
+        if (loc.horizontalAccuracy >= 0
+            && loc.horizontalAccuracy < 50
+            && fabs([loc.timestamp timeIntervalSinceDate:now]) < 30) {
+            [filtered addObject:loc];
+        }
+    }
+    if (filtered.count == 0) return;
+    [routeBuilder insertRouteData:filtered completion:^(BOOL success, NSError * _Nullable err) {
+        if (err) {
+            NSLog(@"[iPhoneWorkout][native] insertRouteData error: %@", err.localizedDescription);
+        }
+    }];
+}
+
+- (void)locationManager:(CLLocationManager *)manager
+       didFailWithError:(NSError *)error {
+    // Transient kCLErrorLocationUnknown is normal during GPS acquisition —
+    // log but don't act. CLLocationManager keeps retrying internally.
+    NSLog(@"[iPhoneWorkout][native] CLLocationManager error: %@", error.localizedDescription);
+}
+
+- (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager {
+    CLAuthorizationStatus status = manager.authorizationStatus;
+    if (status == kCLAuthorizationStatusDenied || status == kCLAuthorizationStatusRestricted) {
+        // User declined — stop pulling and drop the route builder so
+        // finishWorkout doesn't try to attach an empty route. The workout
+        // itself still saves; just no route map.
+        [manager stopUpdatingLocation];
+        manager.delegate = nil;
+        [self rnh_setLocationManager:nil];
+        [self rnh_setRouteBuilder:nil];
+        NSLog(@"[iPhoneWorkout][native] location auth denied — disabling route capture");
+    }
 }
 
 @end
