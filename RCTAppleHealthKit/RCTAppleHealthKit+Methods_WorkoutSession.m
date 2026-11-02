@@ -23,6 +23,15 @@ static char const * const kRNHWorkoutBuilderKey = "RNHWorkoutBuilder";
 static char const * const kRNHWorkoutHRQueryKey = "RNHWorkoutHRQuery";
 static char const * const kRNHWorkoutSessionStartKey = "RNHWorkoutSessionStart";
 
+// Live heart rate straight from the session. HealthKit routes an accessory's
+// readings (AirPods Pro 3 / Powerbeats Pro 2) into the live workout builder
+// but does not necessarily save them to the store while the workout runs, so
+// the anchored store query alone stayed silent (the Fitness app, which reads
+// the builder, showed HR on the same phone). Declared here so the .h stays
+// HealthKit-delegate free.
+@interface RCTAppleHealthKit (RNHLiveBuilderDelegate) <HKLiveWorkoutBuilderDelegate>
+@end
+
 @implementation RCTAppleHealthKit (Methods_WorkoutSession)
 
 #pragma mark - Property accessors via associated objects
@@ -150,6 +159,8 @@ static char const * const kRNHWorkoutSessionStartKey = "RNHWorkoutSessionStart";
         HKLiveWorkoutBuilder *builder = session.associatedWorkoutBuilder;
         builder.dataSource = [[HKLiveWorkoutDataSource alloc] initWithHealthStore:self.healthStore
                                                                     workoutConfiguration:config];
+        // Live HR as the session collects it (see RNHLiveBuilderDelegate).
+        builder.delegate = self;
 
         NSDate *startDate = [NSDate date];
         [session startActivityWithDate:startDate];
@@ -314,6 +325,35 @@ static char const * const kRNHWorkoutSessionStartKey = "RNHWorkoutSessionStart";
 }
 
 #pragma mark - Sample emission
+
+#pragma mark - HKLiveWorkoutBuilderDelegate
+
+- (void)workoutBuilder:(HKLiveWorkoutBuilder *)workoutBuilder didCollectDataOfTypes:(NSSet<HKSampleType *> *)collectedTypes API_AVAILABLE(ios(17.0)) {
+    HKQuantityType *hrType = [HKQuantityType quantityTypeForIdentifier:HKQuantityTypeIdentifierHeartRate];
+    if (![collectedTypes containsObject:hrType]) return;
+    HKStatistics *stats = [workoutBuilder statisticsForType:hrType];
+    HKQuantity *latest = stats.mostRecentQuantity;
+    if (!latest) return;
+    HKUnit *bpm = [[HKUnit countUnit] unitDividedByUnit:[HKUnit minuteUnit]];
+    double value = [latest doubleValueForUnit:bpm];
+    if (value <= 0) return;
+    NSDateInterval *interval = stats.mostRecentQuantityDateInterval;
+    NSDate *start = interval.startDate ?: [NSDate date];
+    NSDate *end = interval.endDate ?: start;
+    NSLog(@"[iPhoneWorkout][native] builder HR: %.0f bpm", value);
+    // Same event and shape as the anchored query, so JS needs no change.
+    [self sendEventWithName:@"healthKit:WorkoutSession:heartRate" body:@{@"samples": @[@{
+        @"value": @(value),
+        @"startDate": @([start timeIntervalSince1970] * 1000),
+        @"endDate": @([end timeIntervalSince1970] * 1000),
+        @"sourceName": @"Workout session",
+        @"sourceBundle": @"",
+    }]}];
+}
+
+- (void)workoutBuilderDidCollectEvent:(HKLiveWorkoutBuilder *)workoutBuilder API_AVAILABLE(ios(17.0)) {
+    // Required by the protocol; workout events (pause/resume, laps) aren't used.
+}
 
 - (void)rnh_emitHeartRateSamples:(NSArray<__kindof HKSample *> *)samples {
     if (samples.count == 0) return;

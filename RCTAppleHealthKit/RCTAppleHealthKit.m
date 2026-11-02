@@ -575,6 +575,15 @@ RCT_EXPORT_METHOD(isWorkoutSessionAvailable:(NSDictionary *)input callback:(RCTR
     [self workoutSession_isAvailable:input callback:callback];
 }
 
+// Marker for JS: this build reads AirPods / Powerbeats heart rate live from
+// the workout builder (RNHLiveBuilderDelegate). Builds without it only watch
+// the HealthKit store, which iOS 27 no longer fills during the session, so
+// the app hides "Start with AirPods" unless this method exists.
+RCT_EXPORT_METHOD(workoutSessionLiveHeartRate:(RCTResponseSenderBlock)callback)
+{
+    callback(@[[NSNull null], @YES]);
+}
+
 RCT_EXPORT_METHOD(startWorkoutSession:(NSDictionary *)input callback:(RCTResponseSenderBlock)callback)
 {
     [self _initializeHealthStore];
